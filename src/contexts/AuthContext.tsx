@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import { AuthChangeEvent, Session, Subscription } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
 
 export interface User {
@@ -31,10 +32,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
     const getInitialSession = async () => {
       try {
-        console.log("🔐 Checking initial authentication state...");
+        console.log('Checking initial authentication state...');
         
         if (!supabase) {
-          console.log("⚠️ Supabase not configured, using mock auth");
+          console.log('Supabase not configured, using mock auth');
           if (mounted) {
             setLoading(false);
           }
@@ -44,7 +45,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         const { data: { session }, error } = await supabase.auth.getSession();
         
         if (error) {
-          console.error("❌ Session error:", error);
+          console.error('Session error:', error);
           if (mounted) {
             setLoading(false);
           }
@@ -52,7 +53,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         }
 
         if (session?.user && mounted) {
-          console.log("✅ Found existing session for:", session.user.email);
+          console.log('Found existing session for:', session.user.email);
           await fetchUserProfile(session.user.id);
         }
         
@@ -60,7 +61,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           setLoading(false);
         }
       } catch (error) {
-        console.error("❌ Initial session error:", error);
+        console.error('Initial session error:', error);
         if (mounted) {
           setLoading(false);
         }
@@ -70,10 +71,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     getInitialSession();
 
     // Listen for auth changes
-    let subscription: any = null;
+    let subscription: Subscription | null = null;
     if (supabase) {
-      const { data } = supabase.auth.onAuthStateChange(async (event, session) => {
-        console.log("🔐 Auth state changed:", event);
+      const { data } = supabase.auth.onAuthStateChange(async (event: AuthChangeEvent, session: Session | null) => {
+        console.log('Auth state changed:', event);
         
         if (mounted) {
           if (session?.user) {
@@ -99,7 +100,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     try {
       if (!supabase) return;
 
-      console.log("👤 Fetching user profile for:", userId);
+      console.log('Fetching user profile for:', userId);
       const { data, error } = await supabase
         .from('profiles')
         .select('*')
@@ -107,7 +108,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         .single();
 
       if (error) {
-        console.error("❌ Profile fetch error:", error);
+        console.error('Profile fetch error:', error);
         return;
       }
 
@@ -122,10 +123,45 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         };
         
         setUser(userProfile);
-        console.log("✅ User profile loaded:", data.email, "Role:", data.role);
+        console.log('User profile loaded:', data.email, 'Role:', data.role);
       }
     } catch (error) {
-      console.error("❌ Profile fetch error:", error);
+      console.error('Profile fetch error:', error);
+    }
+  };
+
+  const checkIsAdmin = async (userId: string): Promise<{ isAdmin: boolean; error?: string }> => {
+    if (!supabase) {
+      return { isAdmin: false, error: 'Authentication service not configured.' };
+    }
+
+    try {
+      const { data: rpcResult, error: rpcError } = await supabase.rpc('is_admin', { user_uuid: userId });
+      if (!rpcError && typeof rpcResult === 'boolean') {
+        return { isAdmin: rpcResult };
+      }
+      if (rpcError) {
+        console.warn('RPC is_admin failed, falling back to profile role lookup:', rpcError);
+      }
+    } catch (error) {
+      console.warn('is_admin RPC exception, falling back to profile role lookup:', error);
+    }
+
+    try {
+      const { data: profile, error: profileError } = await supabase
+        .from('profiles')
+        .select('role')
+        .eq('id', userId)
+        .single();
+
+      if (profileError) {
+        return { isAdmin: false, error: profileError.message };
+      }
+
+      return { isAdmin: profile?.role === 'admin' };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Admin check failed';
+      return { isAdmin: false, error: message };
     }
   };
 
@@ -134,24 +170,12 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       setLoading(true);
       
       if (!supabase) {
-        // Mock authentication for development
-        if (email === "admin@company.com" && password === "admin123456") {
-          const mockUser: User = {
-            id: "mock-admin-id",
-            email: "admin@company.com",
-            full_name: "Admin User",
-            role: "admin"
-          };
-          setUser(mockUser);
-          setLoading(false);
-          console.log("✅ Mock admin login successful");
-          return { success: true };
-        }
         setLoading(false);
-        return { success: false, error: "Invalid credentials" };
+        console.error('Supabase client not available. Cannot sign in.');
+        return { success: false, error: 'Authentication service not configured.' };
       }
 
-      console.log("🔐 Attempting sign in for:", email);
+      console.log('Attempting sign in for:', email);
       
       const { data, error } = await supabase.auth.signInWithPassword({
         email,
@@ -159,24 +183,36 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       });
 
       if (error) {
-        console.error("❌ Sign in error:", error);
+        console.error('Sign in error:', error);
         setLoading(false);
         return { success: false, error: error.message };
       }
 
       if (data.user) {
-        console.log("✅ Sign in successful:", data.user.id);
-        await fetchUserProfile(data.user.id);
-        setLoading(false);
-        return { success: true };
+        console.log('Sign in successful, verifying admin status for:', data.user.id);
+
+        const { isAdmin, error: adminError } = await checkIsAdmin(data.user.id);
+
+        if (isAdmin) {
+          console.log('Admin status confirmed for:', email);
+          await fetchUserProfile(data.user.id);
+          setLoading(false);
+          return { success: true };
+        } else {
+          console.warn('Access Denied: User is not an admin:', email, adminError ? `(${adminError})` : '');
+          await supabase.auth.signOut();
+          setLoading(false);
+          return { success: false, error: adminError || 'Access denied. User is not an admin.' };
+        }
       }
 
       setLoading(false);
-      return { success: false, error: "Unknown error occurred" };
-    } catch (error: any) {
-      console.error("❌ Sign in exception:", error);
+      return { success: false, error: 'Unknown error occurred' };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Sign in failed';
+      console.error('Sign in exception:', error);
       setLoading(false);
-      return { success: false, error: error.message || "Sign in failed" };
+      return { success: false, error: message };
     }
   };
 
@@ -186,10 +222,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       
       if (!supabase) {
         setLoading(false);
-        return { success: false, error: "Authentication not configured" };
+        return { success: false, error: 'Authentication not configured' };
       }
 
-      const { data, error } = await supabase.auth.signUp({
+      const { error } = await supabase.auth.signUp({
         email,
         password,
         options: {
@@ -208,9 +244,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       }
 
       return { success: true };
-    } catch (error: any) {
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Sign up failed';
       setLoading(false);
-      return { success: false, error: error.message || "Sign up failed" };
+      return { success: false, error: message };
     }
   };
 
@@ -223,9 +260,9 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       }
       setUser(null);
       setLoading(false);
-      console.log("✅ Sign out successful");
+      console.log('Sign out successful');
     } catch (error) {
-      console.error("❌ Sign out error:", error);
+      console.error('Sign out error:', error);
       setLoading(false);
     }
   };
@@ -233,7 +270,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const updateProfile = async (updates: Partial<User>): Promise<{ success: boolean; error?: string }> => {
     try {
       if (!supabase || !user) {
-        return { success: false, error: "Not authenticated" };
+        return { success: false, error: 'Not authenticated' };
       }
 
       const { error } = await supabase
@@ -247,8 +284,9 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
       setUser(prev => prev ? { ...prev, ...updates } : null);
       return { success: true };
-    } catch (error: any) {
-      return { success: false, error: error.message || "Update failed" };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Update failed';
+      return { success: false, error: message };
     }
   };
 
@@ -269,6 +307,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   );
 };
 
+// eslint-disable-next-line react-refresh/only-export-components
 export const useAuth = () => {
   const context = useContext(AuthContext);
   if (context === undefined) {
